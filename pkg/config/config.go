@@ -10,8 +10,10 @@ import (
 
 	"github.com/caarlos0/env/v11"
 
+	"github.com/sipeed/picoclaw/pkg"
 	"github.com/sipeed/picoclaw/pkg/credential"
 	"github.com/sipeed/picoclaw/pkg/fileutil"
+	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
 // rrCounter is a global counter for round-robin load balancing across models.
@@ -122,7 +124,12 @@ func (f *FlexibleStringSlice) UnmarshalText(text []byte) error {
 
 }
 
+// CurrentVersion is the latest config schema version
+const CurrentVersion = 1
+
+// Config is the current config structure with version support
 type Config struct {
+
 	Agents AgentsConfig `json:"agents"`
 
 	Bindings []AgentBinding `json:"bindings,omitempty"`
@@ -150,6 +157,21 @@ type Config struct {
 	// BuildInfo contains build-time version information
 
 	BuildInfo BuildInfo `json:"build_info,omitempty"`
+
+	security *SecurityConfig
+}
+
+func (c *Config) WithSecurity(sec *SecurityConfig) *Config {
+	if sec == nil {
+		c.security = sec
+		return c
+	}
+	err := applySecurityConfig(c, sec)
+	if err != nil {
+		return nil
+	}
+	c.security = sec
+	return c
 }
 
 type HooksConfig struct {
@@ -217,6 +239,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	type Alias Config
 
 	aux := &struct {
+
 		Providers *ProvidersConfig `json:"providers,omitempty"`
 
 		Session *SessionConfig `json:"session,omitempty"`
@@ -413,6 +436,7 @@ type ToolFeedbackConfig struct {
 }
 
 type AgentDefaults struct {
+
 	Workspace string `json:"workspace" env:"PICOCLAW_AGENTS_DEFAULTS_WORKSPACE"`
 
 	RestrictToWorkspace bool `json:"restrict_to_workspace" env:"PICOCLAW_AGENTS_DEFAULTS_RESTRICT_TO_WORKSPACE"`
@@ -499,6 +523,7 @@ func (d *AgentDefaults) IsToolFeedbackEnabled() bool {
 // It prefers the new "model_name" field but falls back to "model" for backward compatibility.
 
 func (d *AgentDefaults) GetModelName() string {
+
 
 	if d.ModelName != "" {
 
@@ -595,6 +620,7 @@ type WhatsAppConfig struct {
 }
 
 type TelegramConfig struct {
+
 	Enabled bool `json:"enabled" env:"PICOCLAW_CHANNELS_TELEGRAM_ENABLED"`
 
 	Token string `json:"token" env:"PICOCLAW_CHANNELS_TELEGRAM_TOKEN"`
@@ -1220,6 +1246,7 @@ type ModelConfig struct {
 
 	MaxTokensField string `json:"max_tokens_field,omitempty"` // Field name for max tokens (e.g., "max_completion_tokens")
 
+
 	RequestTimeout int `json:"request_timeout,omitempty"`
 
 	ThinkingLevel string `json:"thinking_level,omitempty"` // Extended thinking: off|low|medium|high|xhigh|adaptive
@@ -1244,6 +1271,15 @@ func (c *ModelConfig) Validate() error {
 
 	return nil
 
+}
+
+func (c *ModelConfig) SetAPIKey(value string) {
+	if len(c.apiKeys) > 0 {
+		c.apiKeys[0] = value
+	} else {
+		c.apiKeys = append(c.apiKeys, value)
+	}
+	c.secDirty = true
 }
 
 type GatewayConfig struct {
@@ -1292,6 +1328,7 @@ type TavilyConfig struct {
 	BaseURL string `json:"base_url" env:"PICOCLAW_TOOLS_WEB_TAVILY_BASE_URL"`
 
 	MaxResults int `json:"max_results" env:"PICOCLAW_TOOLS_WEB_TAVILY_MAX_RESULTS"`
+
 }
 
 type DuckDuckGoConfig struct {
@@ -1332,6 +1369,17 @@ type GLMSearchConfig struct {
 	SearchEngine string `json:"search_engine" env:"PICOCLAW_TOOLS_WEB_GLM_SEARCH_ENGINE"`
 
 	MaxResults int `json:"max_results" env:"PICOCLAW_TOOLS_WEB_GLM_MAX_RESULTS"`
+}
+
+// APIKey returns the GLM search API key
+func (c *GLMSearchConfig) APIKey() string {
+	return c.apiKey
+}
+
+// SetAPIKey sets the GLM search API key (internal use only)
+func (c *GLMSearchConfig) SetAPIKey(key string) {
+	c.apiKey = key
+	c.secDirty = true
 }
 
 type BaiduSearchConfig struct {
@@ -1519,6 +1567,17 @@ type ClawHubRegistryConfig struct {
 	MaxResponseSize int `json:"max_response_size" env:"PICOCLAW_SKILLS_REGISTRIES_CLAWHUB_MAX_RESPONSE_SIZE"`
 }
 
+// AuthToken returns the ClawHub auth token
+func (c *ClawHubRegistryConfig) AuthToken() string {
+	return c.authToken
+}
+
+// SetAuthToken sets the ClawHub auth token
+func (c *ClawHubRegistryConfig) SetAuthToken(token string) {
+	c.authToken = token
+	c.secDirty = true
+}
+
 // MCPServerConfig defines configuration for a single MCP server
 
 type MCPServerConfig struct {
@@ -1661,6 +1720,11 @@ func LoadConfig(path string) (*Config, error) {
 
 	}
 
+	// Resolve security fields like authToken that may contain file:// references
+	if err := resolveSecurityFields(cfg, filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+
 	// Expand multi-key configs into separate entries for key-level failover
 
 	cfg.ModelList = ExpandMultiKeyModels(cfg.ModelList)
@@ -1701,8 +1765,217 @@ func LoadConfig(path string) (*Config, error) {
 
 	}
 
+	// Ensure Workspace has a default if not set
+	if cfg.Agents.Defaults.Workspace == "" {
+		homePath, _ := os.UserHomeDir()
+		if picoclawHome := os.Getenv(EnvHome); picoclawHome != "" {
+			homePath = picoclawHome
+		} else if homePath != "" {
+			homePath = filepath.Join(homePath, pkg.DefaultPicoClawHome)
+		}
+		cfg.Agents.Defaults.Workspace = filepath.Join(homePath, pkg.WorkspaceName)
+	}
+
 	return cfg, nil
 
+}
+
+func copyArray[T any](dst, src *[]T) {
+	*dst = make([]T, len(*src))
+	copy(*dst, *src)
+}
+
+// applySecurityConfig resolves all security references in config
+// It checks each field for "ref:" prefixed values and resolves them from .security.yml
+func applySecurityConfig(cfg *Config, sec *SecurityConfig) error {
+	if sec == nil {
+		return nil
+	}
+
+	if sec.Web.Brave != nil && len(sec.Web.Brave.APIKeys) > 0 {
+		copyArray(&cfg.Tools.Web.Brave.apiKeys, &sec.Web.Brave.APIKeys)
+	}
+
+	if sec.Web.Tavily != nil && len(sec.Web.Tavily.APIKeys) > 0 {
+		copyArray(&cfg.Tools.Web.Tavily.apiKeys, &sec.Web.Tavily.APIKeys)
+	}
+
+	if sec.Web.Perplexity != nil && len(sec.Web.Perplexity.APIKeys) > 0 {
+		copyArray(&cfg.Tools.Web.Perplexity.apiKeys, &sec.Web.Perplexity.APIKeys)
+	}
+
+	if sec.Web.GLMSearch != nil && sec.Web.GLMSearch.APIKey != "" {
+		cfg.Tools.Web.GLMSearch.apiKey = sec.Web.GLMSearch.APIKey
+	}
+
+	if sec.Web.BaiduSearch != nil && sec.Web.BaiduSearch.APIKey != "" {
+		cfg.Tools.Web.BaiduSearch.apiKey = sec.Web.BaiduSearch.APIKey
+	}
+
+	if sec.Skills.Github != nil && sec.Skills.Github.Token != "" {
+		cfg.Tools.Skills.Github.token = sec.Skills.Github.Token
+	}
+
+	if sec.Skills.ClawHub != nil && sec.Skills.ClawHub.AuthToken != "" {
+		cfg.Tools.Skills.Registries.ClawHub.authToken = sec.Skills.ClawHub.AuthToken
+	}
+
+	names := toNameIndex(cfg.ModelList)
+	for i, model := range cfg.ModelList {
+		// Try exact match first (e.g., "abc:0" -> "abc:0")
+		if entry, exists := sec.ModelList[names[i]]; exists {
+			copyArray(&model.apiKeys, &entry.APIKeys)
+			model.secModelName = names[i]
+			continue
+		}
+
+		// Try match without index suffix (e.g., "abc" -> "abc")
+		// This allows .security.yml to use simpler keys like "test-model" instead of "test-model:0"
+		baseName := model.ModelName
+		if entry, exists := sec.ModelList[baseName]; exists {
+			copyArray(&model.apiKeys, &entry.APIKeys)
+			model.secModelName = baseName
+			continue
+		}
+	}
+
+	// Handle Telegram token
+	if sec.Channels.Telegram != nil && sec.Channels.Telegram.Token != "" {
+		cfg.Channels.Telegram.token = sec.Channels.Telegram.Token
+	}
+
+	// Handle Feishu credentials
+	if sec.Channels.Feishu != nil {
+		if sec.Channels.Feishu.AppSecret != "" {
+			cfg.Channels.Feishu.appSecret = sec.Channels.Feishu.AppSecret
+		}
+		if sec.Channels.Feishu.EncryptKey != "" {
+			cfg.Channels.Feishu.encryptKey = sec.Channels.Feishu.EncryptKey
+		}
+		if sec.Channels.Feishu.VerificationToken != "" {
+			cfg.Channels.Feishu.verificationToken = sec.Channels.Feishu.VerificationToken
+		}
+	}
+
+	// Handle Discord token
+	if sec.Channels.Discord != nil && sec.Channels.Discord.Token != "" {
+		cfg.Channels.Discord.token = sec.Channels.Discord.Token
+	}
+
+	// Handle Weixin token
+	if sec.Channels.Weixin != nil && sec.Channels.Weixin.Token != "" {
+		cfg.Channels.Discord.token = sec.Channels.Discord.Token
+	}
+
+	// Handle DingTalk client secret
+	if sec.Channels.DingTalk != nil && sec.Channels.DingTalk.ClientSecret != "" {
+		cfg.Channels.DingTalk.clientSecret = sec.Channels.DingTalk.ClientSecret
+	}
+
+	// Handle Slack tokens
+	if sec.Channels.Slack != nil {
+		if sec.Channels.Slack.BotToken != "" {
+			cfg.Channels.Slack.botToken = sec.Channels.Slack.BotToken
+		}
+		if sec.Channels.Slack.AppToken != "" {
+			cfg.Channels.Slack.appToken = sec.Channels.Slack.AppToken
+		}
+	}
+
+	// Handle Matrix access token
+	if sec.Channels.Matrix != nil && sec.Channels.Matrix.AccessToken != "" {
+		cfg.Channels.Matrix.accessToken = sec.Channels.Matrix.AccessToken
+	}
+
+	// Handle LINE credentials
+	if sec.Channels.LINE != nil {
+		if sec.Channels.LINE.ChannelSecret != "" {
+			cfg.Channels.LINE.channelSecret = sec.Channels.LINE.ChannelSecret
+		}
+		if sec.Channels.LINE.ChannelAccessToken != "" {
+			cfg.Channels.LINE.channelAccessToken = sec.Channels.LINE.ChannelAccessToken
+		}
+	}
+
+	// Handle OneBot access token
+	if sec.Channels.OneBot != nil && sec.Channels.OneBot.AccessToken != "" {
+		cfg.Channels.OneBot.accessToken = sec.Channels.OneBot.AccessToken
+	}
+
+	// Handle WeCom token and encoding key
+	if sec.Channels.WeCom != nil {
+		if sec.Channels.WeCom.Token != "" {
+			cfg.Channels.WeCom.token = sec.Channels.WeCom.Token
+		}
+		if sec.Channels.WeCom.EncodingAESKey != "" {
+			cfg.Channels.WeCom.encodingAESKey = sec.Channels.WeCom.EncodingAESKey
+		}
+	}
+
+	// Handle WeCom App credentials
+	if sec.Channels.WeComApp != nil {
+		if sec.Channels.WeComApp.CorpSecret != "" {
+			cfg.Channels.WeComApp.corpSecret = sec.Channels.WeComApp.CorpSecret
+		}
+		if sec.Channels.WeComApp.Token != "" {
+			cfg.Channels.WeComApp.token = sec.Channels.WeComApp.Token
+		}
+		if sec.Channels.WeComApp.EncodingAESKey != "" {
+			cfg.Channels.WeComApp.encodingAESKey = sec.Channels.WeComApp.EncodingAESKey
+		}
+	}
+
+	// Handle WeCom AI Bot credentials
+	if sec.Channels.WeComAIBot != nil {
+		if sec.Channels.WeComAIBot.Token != "" {
+			cfg.Channels.WeComAIBot.token = sec.Channels.WeComAIBot.Token
+		}
+		if sec.Channels.WeComAIBot.EncodingAESKey != "" {
+			cfg.Channels.WeComAIBot.encodingAESKey = sec.Channels.WeComAIBot.EncodingAESKey
+		}
+		if sec.Channels.WeComAIBot.Secret != "" {
+			cfg.Channels.WeComAIBot.secret = sec.Channels.WeComAIBot.Secret
+		}
+	}
+
+	// Handle Pico channel token
+	if sec.Channels.Pico != nil && sec.Channels.Pico.Token != "" {
+		cfg.Channels.Pico.token = sec.Channels.Pico.Token
+	}
+
+	// Handle IRC passwords
+	if sec.Channels.IRC != nil {
+		if sec.Channels.IRC.Password != "" {
+			cfg.Channels.IRC.password = sec.Channels.IRC.Password
+		}
+		if sec.Channels.IRC.NickServPassword != "" {
+			cfg.Channels.IRC.nickServPassword = sec.Channels.IRC.NickServPassword
+		}
+		if sec.Channels.IRC.SASLPassword != "" {
+			cfg.Channels.IRC.saslPassword = sec.Channels.IRC.SASLPassword
+		}
+	}
+
+	// Handle QQ app secret
+	if sec.Channels.QQ != nil && sec.Channels.QQ.AppSecret != "" {
+		cfg.Channels.QQ.appSecret = sec.Channels.QQ.AppSecret
+	}
+
+	cfg.security = sec
+
+	return nil
+}
+
+func toNameIndex(list []*ModelConfig) []string {
+	nameList := make([]string, 0, len(list))
+	countMap := make(map[string]int)
+	for _, model := range list {
+		name := model.ModelName
+		index := countMap[name]
+		nameList = append(nameList, fmt.Sprintf("%s:%d", name, index))
+		countMap[name]++
+	}
+	return nameList
 }
 
 // encryptPlaintextAPIKeys returns a copy of models with plaintext api_key values
@@ -1862,6 +2135,10 @@ func SaveConfig(path string, cfg *Config) error {
 
 		}
 
+	}
+	if err := saveSecurityConfig(securityPath(path), cfg.security); err != nil {
+		logger.ErrorCF("config", "cannot save .security.yml", map[string]any{"error": err})
+		return err
 	}
 
 	data, err := json.MarshalIndent(cfg, "", "  ")
@@ -2048,6 +2325,7 @@ func (c *Config) findMatches(modelName string) []ModelConfig {
 
 }
 
+
 // HasProvidersConfig checks if any provider in the old providers config has configuration.
 
 func (c *Config) HasProvidersConfig() bool {
@@ -2076,6 +2354,10 @@ func (c *Config) ValidateModelList() error {
 
 	return nil
 
+}
+
+func (c *Config) SecurityCopyFrom(cfg *Config) {
+	c.security = cfg.security
 }
 
 func MergeAPIKeys(apiKey string, apiKeys []string) []string {

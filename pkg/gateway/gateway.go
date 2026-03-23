@@ -399,9 +399,6 @@ func handleConfigReload(
 	logger.Info("🔄 Config file changed, reloading...")
 
 	newModel := newCfg.Agents.Defaults.ModelName
-	if newModel == "" {
-		newModel = newCfg.Agents.Defaults.Model
-	}
 
 	logger.Infof(" New model is '%s', recreating provider...", newModel)
 	logger.Info("  Stopping all services...")
