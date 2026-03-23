@@ -31,9 +31,6 @@ const SECRET_FIELDS = new Set([
   "password",
   "nickserv_password",
   "sasl_password",
-  "tls_ca",
-  "tls_cert",
-  "tls_key",
 ])
 
 // Fields to skip in the generic form (handled by enabled toggle or internal).

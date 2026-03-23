@@ -158,13 +158,8 @@ func (m *Manager) RecordReactionUndo(channel, chatID string, undo func()) {
 }
 
 // preSend handles typing stop, reaction undo, and placeholder editing before sending a message.
-// Returns true if the message was edited into a placeholder (skip Send).
-func (m *Manager) preSend(
-	ctx context.Context,
-	name string,
-	msg bus.OutboundMessage,
-	ch Channel,
-) bool {
+// Returns true if the message was already delivered (skip Send).
+func (m *Manager) preSend(ctx context.Context, name string, msg bus.OutboundMessage, ch Channel) bool {
 	key := name + ":" + msg.ChatID
 
 	// 1. Stop typing
@@ -211,11 +206,7 @@ func (m *Manager) preSend(
 	return false
 }
 
-func NewManager(
-	cfg *config.Config,
-	messageBus *bus.MessageBus,
-	store media.MediaStore,
-) (*Manager, error) {
+func NewManager(cfg *config.Config, messageBus *bus.MessageBus, store media.MediaStore) (*Manager, error) {
 	m := &Manager{
 		channels:      make(map[string]Channel),
 		workers:       make(map[string]*channelWorker),
@@ -633,12 +624,7 @@ func (m *Manager) runWorker(ctx context.Context, name string, w *channelWorker) 
 //   - ErrNotRunning / ErrSendFailed: permanent, no retry
 //   - ErrRateLimit: fixed delay retry
 //   - ErrTemporary / unknown: exponential backoff retry
-func (m *Manager) sendWithRetry(
-	ctx context.Context,
-	name string,
-	w *channelWorker,
-	msg bus.OutboundMessage,
-) {
+func (m *Manager) sendWithRetry(ctx context.Context, name string, w *channelWorker, msg bus.OutboundMessage) {
 	// Rate limit: wait for token
 	if err := w.limiter.Wait(ctx); err != nil {
 		// ctx canceled, shutting down
@@ -678,10 +664,7 @@ func (m *Manager) sendWithRetry(
 		}
 
 		// ErrTemporary or unknown error — exponential backoff
-		backoff := min(
-			time.Duration(float64(baseBackoff)*math.Pow(2, float64(attempt))),
-			maxBackoff,
-		)
+		backoff := min(time.Duration(float64(baseBackoff)*math.Pow(2, float64(attempt))), maxBackoff)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -806,21 +789,12 @@ func (m *Manager) runMediaWorker(ctx context.Context, name string, w *channelWor
 
 // sendMediaWithRetry sends a media message through the channel with rate limiting and
 // retry logic. If the channel does not implement MediaSender, it silently skips.
-func (m *Manager) sendMediaWithRetry(
-	ctx context.Context,
-	name string,
-	w *channelWorker,
-	msg bus.OutboundMediaMessage,
-) {
+func (m *Manager) sendMediaWithRetry(ctx context.Context, name string, w *channelWorker, msg bus.OutboundMediaMessage) {
 	ms, ok := w.ch.(MediaSender)
 	if !ok {
-		logger.DebugCF(
-			"channels",
-			"Channel does not support MediaSender, skipping media",
-			map[string]any{
-				"channel": name,
-			},
-		)
+		logger.DebugCF("channels", "Channel does not support MediaSender, skipping media", map[string]any{
+			"channel": name,
+		})
 		return
 	}
 
@@ -857,10 +831,7 @@ func (m *Manager) sendMediaWithRetry(
 		}
 
 		// ErrTemporary or unknown error — exponential backoff
-		backoff := min(
-			time.Duration(float64(baseBackoff)*math.Pow(2, float64(attempt))),
-			maxBackoff,
-		)
+		backoff := min(time.Duration(float64(baseBackoff)*math.Pow(2, float64(attempt))), maxBackoff)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
